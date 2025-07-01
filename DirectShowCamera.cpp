@@ -1,7 +1,11 @@
 #include "DirectShowCamera.h"
+#include <windows.h>
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <cmath>
+#include <vector>
+#include <string>
 
 // Link required DirectShow libraries
 #pragma comment(lib, "strmiids.lib")
@@ -10,8 +14,10 @@
 
 // Implementation of CSampleGrabberCB
 CSampleGrabberCB::CSampleGrabberCB()
-    : m_refCount(1), m_frameCount(0), m_startTime(GetTickCount()), m_lastFrameTime(0)
+    : m_refCount(1), m_frameCount(0)
 {
+    m_startTime = GetTickCount();
+    m_lastFrameTime = 0;
 }
 
 STDMETHODIMP CSampleGrabberCB::QueryInterface(REFIID riid, void** ppv)
@@ -114,6 +120,116 @@ double CSampleGrabberCB::CalculateAverageBrightness(BYTE* frameData, long frameS
     }
     return frameSize > 0 ? (double)totalBrightness / (frameSize / 3) : 0.0;
 }
+
+// Custom callback class that saves frames
+class CFrameSavingCallback : public CSampleGrabberCB
+{
+private:
+    bool m_frameSaved;
+    int m_imageWidth;
+    int m_imageHeight;
+
+public:
+    CFrameSavingCallback() : m_frameSaved(false), m_imageWidth(0), m_imageHeight(0) {}
+
+    void SetImageDimensions(int width, int height)
+    {
+        m_imageWidth = width;
+        m_imageHeight = height;
+    }
+
+    void ProcessFrame(BYTE* frameData, long frameSize) override
+    {
+        // Call base class processing
+        CSampleGrabberCB::ProcessFrame(frameData, frameSize);
+
+        // Save the first frame we receive
+        if (!m_frameSaved && frameData && frameSize > 0)
+        {
+            SaveFrameAsBMP(frameData, frameSize);
+            m_frameSaved = true;
+        }
+    }
+
+private:
+    void SaveFrameAsBMP(BYTE* frameData, long frameSize)
+    {
+        // For RGB24 format: 3 bytes per pixel
+        int bytesPerPixel = 3;
+
+        if (m_imageWidth == 0 || m_imageHeight == 0)
+        {
+            // Try to estimate dimensions from frame size
+            // Assume square-ish image for estimation
+            int totalPixels = frameSize / bytesPerPixel;
+            m_imageWidth = (int)std::sqrt(totalPixels * 1.33); // Assume 4:3 aspect ratio
+            m_imageHeight = totalPixels / m_imageWidth;
+
+            std::cout << "Estimated image dimensions: " << m_imageWidth << "x" << m_imageHeight << std::endl;
+        }
+
+        std::string filename = "captured_frame.bmp";
+
+        // BMP file header
+        BITMAPFILEHEADER bfh;
+        BITMAPINFOHEADER bih;
+
+        // Initialize BMP file header
+        memset(&bfh, 0, sizeof(bfh));
+        bfh.bfType = 0x4D42; // "BM"
+        bfh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+        bfh.bfSize = bfh.bfOffBits + frameSize;
+
+        // Initialize BMP info header
+        memset(&bih, 0, sizeof(bih));
+        bih.biSize = sizeof(BITMAPINFOHEADER);
+        bih.biWidth = m_imageWidth;
+        bih.biHeight = -m_imageHeight; // Negative height for top-down bitmap
+        bih.biPlanes = 1;
+        bih.biBitCount = 24; // RGB24
+        bih.biCompression = BI_RGB;
+        bih.biSizeImage = frameSize;
+
+        // Create and write BMP file
+        HANDLE hFile = CreateFileA(filename.c_str(), GENERIC_WRITE, 0, NULL,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+        if (hFile != INVALID_HANDLE_VALUE)
+        {
+            DWORD bytesWritten;
+
+            // Write BMP headers
+            WriteFile(hFile, &bfh, sizeof(bfh), &bytesWritten, NULL);
+            WriteFile(hFile, &bih, sizeof(bih), &bytesWritten, NULL);
+
+            // RGB24 data in DirectShow is usually BGR, so we need to convert to RGB
+            std::vector<BYTE> rgbData(frameSize);
+            for (long i = 0; i < frameSize; i += 3)
+            {
+                if (i + 2 < frameSize)
+                {
+                    // Convert BGR to RGB
+                    rgbData[i] = frameData[i + 2];     // R
+                    rgbData[i + 1] = frameData[i + 1]; // G  
+                    rgbData[i + 2] = frameData[i];     // B
+                }
+            }
+
+            // Write image data
+            WriteFile(hFile, rgbData.data(), frameSize, &bytesWritten, NULL);
+
+            CloseHandle(hFile);
+
+            std::cout << "Frame saved as: " << filename << std::endl;
+            std::cout << "Image size: " << m_imageWidth << "x" << m_imageHeight << std::endl;
+            std::cout << "Data size: " << frameSize << " bytes" << std::endl;
+        }
+        else
+        {
+            std::cout << "Failed to create file: " << filename << std::endl;
+        }
+    }
+};
 
 // Implementation of DirectShowCamera
 DirectShowCamera::DirectShowCamera()
@@ -425,6 +541,41 @@ HRESULT DirectShowCamera::GetGraphState(OAFilterState& state)
     return m_pMediaControl->GetState(100, &state);
 }
 
+HRESULT DirectShowCamera::GetCameraFormat(int& width, int& height)
+{
+    if (!m_pSampleGrabber)
+        return E_FAIL;
+
+    AM_MEDIA_TYPE mt;
+    HRESULT hr = m_pSampleGrabber->GetConnectedMediaType(&mt);
+
+    if (SUCCEEDED(hr) && mt.formattype == FORMAT_VideoInfo)
+    {
+        VIDEOINFOHEADER* pVih = (VIDEOINFOHEADER*)mt.pbFormat;
+        width = pVih->bmiHeader.biWidth;
+        height = abs(pVih->bmiHeader.biHeight);
+
+        // Store in current capabilities
+        m_currentCapabilities.width = width;
+        m_currentCapabilities.height = height;
+
+        // Free the media type
+        if (mt.cbFormat != 0)
+        {
+            CoTaskMemFree((PVOID)mt.pbFormat);
+            mt.cbFormat = 0;
+            mt.pbFormat = NULL;
+        }
+        if (mt.pUnk != NULL)
+        {
+            mt.pUnk->Release();
+            mt.pUnk = NULL;
+        }
+    }
+
+    return hr;
+}
+
 void DirectShowCamera::Cleanup()
 {
     if (m_isCapturing)
@@ -485,7 +636,7 @@ void DirectShowCamera::LogError(const std::wstring& operation, HRESULT hr)
     std::wcout << L"Error in " << operation << L": " << GetErrorDescription(hr) << std::endl;
 }
 
-// Simple main function demonstrating usage
+// Updated main function with frame saving
 int main()
 {
     std::cout << "DirectShow USB Camera Capture Application" << std::endl;
@@ -534,12 +685,29 @@ int main()
         return -1;
     }
 
+    // Create a custom callback that saves frames
+    CFrameSavingCallback* pFrameSaver = new CFrameSavingCallback();
+    camera.SetCustomCallback(pFrameSaver);
+
     // Build the filter graph
     hr = camera.BuildFilterGraph();
     if (FAILED(hr))
     {
         std::cout << "Failed to build filter graph. Error: 0x" << std::hex << hr << std::endl;
         return -1;
+    }
+
+    // Get the actual camera format after connection
+    int width, height;
+    hr = camera.GetCameraFormat(width, height);
+    if (SUCCEEDED(hr))
+    {
+        std::cout << "Camera format: " << width << "x" << height << std::endl;
+        pFrameSaver->SetImageDimensions(width, height);
+    }
+    else
+    {
+        std::cout << "Could not determine camera format, will estimate from data" << std::endl;
     }
 
     // Start capture
@@ -550,6 +718,7 @@ int main()
         return -1;
     }
 
+    std::cout << "Capturing frames... The first frame will be saved as 'captured_frame.bmp'" << std::endl;
     std::cout << "Press Enter to stop capture..." << std::endl;
     std::cin.ignore();
     std::cin.get();
